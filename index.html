@@ -532,21 +532,25 @@ async function ensureProfile(){
     await SB.from('profiles').insert({id:meId, name:nm, email:AUTHED.email||''});
   }
 }
+let loginBusy = false;
 async function afterLogin(){
-  if(!AUTHED) return;
-  meId = AUTHED.id;
-  if(!booted){
-    bindMarketClick(); renderCats(); switchTab('market'); booted=true; // 界面先上，市场显示加载占位
-  }
+  if(!AUTHED || loginBusy) return; // 注册成功瞬间 doRegister 与 onAuthStateChange 会同时调它：只跑一份，防止重复拉取
+  loginBusy = true;
   try{
-    await ensureProfile();
-    await loadAll();
-    markSyncStamp();
-    dataLoaded = true;
-  }catch(e){ toast('数据加载失败，稍后自动重试'); }
-  hideGate();
-  refreshIdentity(); updateBadge();
-  renderCurrent();
+    meId = AUTHED.id;
+    if(!booted){
+      bindMarketClick(); renderCats(); switchTab('market'); booted=true; // 界面先上，市场显示加载占位
+    }
+    hideGate(); refreshIdentity(); // ★先放用户进主界面：跨境慢网时不再干等数据（身份先显示默认昵称，数据到了下面再刷）
+    try{
+      await ensureProfile();
+      await loadAll();
+      markSyncStamp();
+      dataLoaded = true;
+    }catch(e){ toast('数据加载失败，稍后自动重试'); }
+    refreshIdentity(); updateBadge();
+    renderCurrent();
+  }finally{ loginBusy = false; }
 }
 
 /* ===================== 数据同步 ===================== */
@@ -1161,29 +1165,43 @@ function renderAdmin(){
     || '<div class="muted" style="padding:12px 0">暂无被封禁用户</div>';
 }
 
-/* ===================== 轮询同步（轻量探针，有变化才拉全量） ===================== */
-setInterval(async ()=>{
-  if(!AUTHED || !SB || document.hidden) return;
-  try{
-    // 两个零流量探针（都只数条数不传正文）：消息数 + 商品数
-    const [msg, it] = await Promise.all([
-      SB.from('messages').select('id',{count:'exact',head:true}).or('sender.eq.'+meId+',receiver.eq.'+meId),
-      SB.from('items').select('id',{count:'exact',head:true})
-    ]);
-    if(msg.error || it.error) return;
-    const stamp = 'm'+(msg.count||0)+'_i'+(it.count||0);
-    // 印记与探针同口径：本端"非临时消息数 + 商品数"
-    const localMsgN = db.messages.filter(m=>String(m.id).indexOf('tmp_')!==0).length;
-    const localStamp = 'm'+localMsgN+'_i'+db.items.length;
-    if(stamp !== localStamp || lastSyncStamp===0){
-      await loadAll();
-      const n2 = db.messages.filter(m=>String(m.id).indexOf('tmp_')!==0).length;
-      lastSyncStamp = 'm'+n2+'_i'+db.items.length;
-      updateBadge();
-      renderCurrent();
-    }
-  }catch(e){}
-}, 2000);
+/* ===================== 轮询同步（串行防堆积 + 超时防挂起 + 按网速自适应间隔） ===================== */
+/* 背景教训：跨境网络偶发 5~15 秒延迟时，固定 2 秒 setInterval 会不断发起新一轮请求，
+   未完成的旧请求越积越多，占满浏览器对同一网站的 6 个并发连接上限，
+   连登录后的正常刷新都被排队卡死，整个网页像死机。以下三重保险根治： */
+let pollBusy = false, pollDelay = 2000;
+const raceTimeout = (p, ms) => Promise.race([p, new Promise((_,rj)=>setTimeout(()=>rj(new Error('网络超时')), ms))]);
+(function pollLoop(){
+  setTimeout(async ()=>{
+    try{
+      if(AUTHED && SB && meId && !document.hidden && !pollBusy){
+        pollBusy = true; // 保险①：同一时刻只允许一轮轮询在跑，上一轮没回来绝不发下一轮
+        const t0 = Date.now();
+        try{
+          const [msg, it] = await raceTimeout(Promise.all([
+            SB.from('messages').select('id',{count:'exact',head:true}).or('sender.eq.'+meId+',receiver.eq.'+meId),
+            SB.from('items').select('id',{count:'exact',head:true})
+          ]), 15000); // 保险②：探针 15 秒拿不到数就放弃本轮，轮询永不挂在慢请求上
+          if(!msg.error && !it.error){ // 探针失败只跳过本轮，不触发全量拉取（防止慢网重试风暴）
+            const stamp = 'm'+(msg.count||0)+'_i'+(it.count||0);
+            const localMsgN = db.messages.filter(m=>String(m.id).indexOf('tmp_')!==0).length;
+            const localStamp = 'm'+localMsgN+'_i'+db.items.length;
+            if(stamp !== localStamp || lastSyncStamp===0){
+              await raceTimeout(loadAll(), 25000);
+              const n2 = db.messages.filter(m=>String(m.id).indexOf('tmp_')!==0).length;
+              lastSyncStamp = 'm'+n2+'_i'+db.items.length;
+              updateBadge();
+              renderCurrent();
+            }
+          }
+        } finally { pollBusy = false; }
+        const cost = Date.now() - t0; // 保险③：按实际耗时自适应间隔——快网 2 秒，慢网自动退避 5~12 秒
+        pollDelay = cost>6000 ? 12000 : (cost>2500 ? 5000 : 2000);
+      }
+    }catch(e){ pollDelay = Math.min(Math.max(pollDelay,2000)*2, 15000); } // 出错逐步退避，最快 2 次翻倍封顶 15 秒
+    pollLoop(); // 上一轮彻底结束后才调度下一轮
+  }, pollDelay);
+})();
 
 /* ===================== 启动 ===================== */
 function renderCats(){
